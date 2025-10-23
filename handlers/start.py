@@ -31,7 +31,12 @@ async def grant_access_to_bot(message: types.Message, user_id: int):
             logger.info(f"New user created: {user_id}, username: {user_name}")
 
         keyboard_start = InlineKeyboardMarkup(row_width=1)
-        keyboard_start.add(InlineKeyboardButton("📝 Умная лента сборки заказов WB FBS", callback_data='process_orders'))
+        keyboard_start.add(
+            InlineKeyboardButton("📝 Умная лента сборки заказов WB FBS", callback_data='process_orders_wb')
+        )
+        keyboard_start.add(
+            InlineKeyboardButton("📦 Группировка стикеров OZON", callback_data='process_orders_ozon')
+        )
         keyboard_start.add(InlineKeyboardButton("💬 Написать в поддержку", url='https://t.me/jeni_ll'))
     
         file_id = await get_image_file_id(IMAGE_NAME)
@@ -104,7 +109,12 @@ async def start(callback_query: types.CallbackQuery, state: FSMContext):
             await session.commit()
 
         keyboard_start = InlineKeyboardMarkup(row_width=1)
-        keyboard_start.add(InlineKeyboardButton("📝 Умная лента сборки заказов WB FBS", callback_data='process_orders'))
+        keyboard_start.add(
+            InlineKeyboardButton("📝 Умная лента сборки заказов WB FBS", callback_data='process_orders_wb')
+        )
+        keyboard_start.add(
+            InlineKeyboardButton("📦 Группировка стикеров OZON", callback_data='process_orders_ozon')
+        )
         keyboard_start.add(InlineKeyboardButton("💬 Написать в поддержку", url='https://t.me/jeni_ll'))
 
         file_id = await get_image_file_id(IMAGE_NAME)
