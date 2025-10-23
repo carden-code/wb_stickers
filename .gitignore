@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project specific
+*.log
+.env
+.env.local
+.env.*.local
+
+# Database
+*.db
+*.sqlite3
+*.sqlite
+
+# PDF files (если они генерируются временно)
+*.pdf
+
+# Временные файлы
+*.tmp
+*~
+.DS_Store
+ozon_files_example/
+CLAUDE.md
