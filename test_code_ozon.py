@@ -18,6 +18,7 @@ Ozon stickers → WB-style сортировка (v9)
 from __future__ import annotations
 
 import argparse
+import logging
 import re
 from collections import defaultdict, OrderedDict
 from pathlib import Path
@@ -26,6 +27,16 @@ import fitz  # PyMuPDF
 
 
 OZON_SHIP_RE = re.compile(r"\b\d{6,}-\d{3,5}-\d\b")  # пример: 58678967-0003-4
+OZON_SHIP_LOOSE_RE = re.compile(r"\d+\s+\d+\s*-\s*\d{3,5}\s*-\s*\d(?!\d)")
+
+
+def find_ships_loose(text: str) -> list[str]:
+    out: list[str] = []
+    for m in OZON_SHIP_LOOSE_RE.findall(text):
+        normalized = re.sub(r"\s+", "", m)
+        if OZON_SHIP_RE.fullmatch(normalized):
+            out.append(normalized)
+    return out
 
 
 # ---------- Утилиты для извлечения колонок и текста ----------
@@ -154,6 +165,14 @@ def map_ticket_pages(ticket_pdf: Path) -> dict[str, list[int]]:
     for i, page in enumerate(doc):
         text = page.get_text("text")
         ships = OZON_SHIP_RE.findall(text)
+        if not ships:
+            ships = find_ships_loose(text)
+            if ships:
+                logging.info(
+                    "OZON ticket page %d: matched via loose fallback (%d ships)",
+                    i,
+                    len(ships),
+                )
         for s in ships:
             if i not in ship_to_pages[s]:
                 ship_to_pages[s].append(i)

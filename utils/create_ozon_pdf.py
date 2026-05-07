@@ -11,6 +11,16 @@ import fitz  # PyMuPDF
 
 
 OZON_SHIP_RE = re.compile(r"\b\d{6,}-\d{3,5}-\d\b")
+OZON_SHIP_LOOSE_RE = re.compile(r"\d+\s+\d+\s*-\s*\d{3,5}\s*-\s*\d(?!\d)")
+
+
+def _find_ships_loose(text: str) -> list[str]:
+    out: list[str] = []
+    for m in OZON_SHIP_LOOSE_RE.findall(text):
+        normalized = re.sub(r"\s+", "", m)
+        if OZON_SHIP_RE.fullmatch(normalized):
+            out.append(normalized)
+    return out
 
 
 def _detect_columns_from_header(doc: fitz.Document) -> dict[str, float]:
@@ -124,6 +134,14 @@ def _map_ticket_pages(ticket_pdf: Path) -> dict[str, list[int]]:
         for i, page in enumerate(doc):
             text = page.get_text("text")
             ships = OZON_SHIP_RE.findall(text)
+            if not ships:
+                ships = _find_ships_loose(text)
+                if ships:
+                    logging.info(
+                        "OZON ticket page %d: matched via loose fallback (%d ships)",
+                        i,
+                        len(ships),
+                    )
             for ship in ships:
                 if i not in ship_to_pages[ship]:
                     ship_to_pages[ship].append(i)
