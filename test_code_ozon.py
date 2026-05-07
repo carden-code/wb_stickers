@@ -27,7 +27,7 @@ import fitz  # PyMuPDF
 
 
 OZON_SHIP_RE = re.compile(r"\b\d{6,}-\d{3,5}-\d\b")  # пример: 58678967-0003-4
-OZON_SHIP_LOOSE_RE = re.compile(r"\d+\s+\d+\s*-\s*\d{3,5}\s*-\s*\d(?!\d)")
+OZON_SHIP_LOOSE_RE = re.compile(r"\d{1,6}\s+\d{1,6}\s*-\s*\d{3,5}\s*-\s*\d(?!\d)")
 
 
 def find_ships_loose(text: str) -> list[str]:
@@ -164,15 +164,15 @@ def map_ticket_pages(ticket_pdf: Path) -> dict[str, list[int]]:
     ship_to_pages: dict[str, list[int]] = defaultdict(list)
     for i, page in enumerate(doc):
         text = page.get_text("text")
-        ships = OZON_SHIP_RE.findall(text)
-        if not ships:
-            ships = find_ships_loose(text)
-            if ships:
-                logging.info(
-                    "OZON ticket page %d: matched via loose fallback (%d ships)",
-                    i,
-                    len(ships),
-                )
+        ships = find_ships_loose(text)
+        if ships:
+            logging.info(
+                "OZON ticket page %d: matched via split-prefix layout (%d ships)",
+                i,
+                len(ships),
+            )
+        else:
+            ships = OZON_SHIP_RE.findall(text)
         for s in ships:
             if i not in ship_to_pages[s]:
                 ship_to_pages[s].append(i)
