@@ -89,23 +89,25 @@ def detect_columns_from_header(doc: fitz.Document) -> dict[str, float]:
 
 def column_bounds(x_cols: dict[str, float], name: str) -> tuple[float, float]:
     """
-    По словарю {col: x0} считает границы колонки по серединам между соседями.
+    [left, right) границы колонки, привязанные к левым краям заголовков:
+    `left = xs[idx]`, `right = xs[idx+1]`. Midpoint был слишком широк с обеих
+    сторон: справа отбрасывал хвостовые токены статьи (`"`, продолжения слов),
+    которые Озон рендерит за midpoint, но до начала следующей колонки; слева
+    пропускал переносы из «Товар» (например `сердцу"` на x≈307).
     """
     names = list(x_cols.keys())
     xs = list(x_cols.values())
-    mids = []
-    for i in range(len(xs) - 1):
-        mids.append((xs[i] + xs[i + 1]) / 2.0)
 
     idx = names.index(name)
-    left = float("-inf") if idx == 0 else mids[idx - 1]
-    right = float("inf") if idx == len(xs) - 1 else mids[idx]
+    left = float("-inf") if idx == 0 else xs[idx]
+    right = float("inf") if idx == len(xs) - 1 else xs[idx + 1]
     return left, right
 
 
 def normalize_text(s: str) -> str:
     s = re.sub(r"\s+([,.)»”])", r"\1", s)
     s = re.sub(r"([«“(])\s+", r"\1", s)
+    s = re.sub(r'(\s|^)"\s+(?=\S)', r'\1"', s)
     s = re.sub(r"\s{2,}", " ", s)
     return s.strip()
 

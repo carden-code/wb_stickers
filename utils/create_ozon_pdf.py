@@ -82,14 +82,21 @@ def _detect_columns_from_header(doc: fitz.Document) -> dict[str, float]:
 
 
 def _column_bounds(x_cols: dict[str, float], name: str) -> tuple[float, float]:
-    """Calculate left/right bounds for the column based on neighbours."""
+    """Return [left, right) bounds anchored on header left edges.
+
+    Both edges use header left positions (`xs[idx]` for left, `xs[idx+1]` for
+    right). The previous midpoint heuristic was too wide: the right side
+    dropped legitimate trailing article tokens (`"`, continuation words) that
+    Ozon renders past the midpoint but before the next column, while the
+    left side let tokens from the wrapping Товар column leak in (e.g.
+    `сердцу"` at x≈307 in `assembly_list (1).pdf`).
+    """
     names = list(x_cols.keys())
     xs = list(x_cols.values())
-    mids = [(xs[i] + xs[i + 1]) / 2.0 for i in range(len(xs) - 1)]
 
     idx = names.index(name)
-    left = float("-inf") if idx == 0 else mids[idx - 1]
-    right = float("inf") if idx == len(xs) - 1 else mids[idx]
+    left = float("-inf") if idx == 0 else xs[idx]
+    right = float("inf") if idx == len(xs) - 1 else xs[idx + 1]
     return left, right
 
 
@@ -97,6 +104,9 @@ def _normalize_text(value: str) -> str:
     """Cleanup whitespace artefacts inside joined tokens."""
     value = re.sub(r"\s+([,.)»”])", r"\1", value)
     value = re.sub(r"([«“(])\s+", r"\1", value)
+    # ASCII `"` rendered as a standalone token gets sandwiched by spaces on
+    # join. Treat ` " word` as an opening quote and attach it to the word.
+    value = re.sub(r'(\s|^)"\s+(?=\S)', r'\1"', value)
     value = re.sub(r"\s{2,}", " ", value)
     return value.strip()
 
