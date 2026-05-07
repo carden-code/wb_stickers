@@ -30,13 +30,29 @@ OZON_SHIP_RE = re.compile(r"\b\d{6,}-\d{3,5}-\d\b")  # пример: 58678967-00
 OZON_SHIP_LOOSE_RE = re.compile(r"\d{1,6}\s+\d{1,6}\s*-\s*\d{3,5}\s*-\s*\d(?!\d)")
 
 
-def find_ships_loose(text: str) -> list[str]:
+def find_ships_in_text(text: str) -> tuple[list[str], int]:
+    """Return (ships, n_split_prefix). See utils.create_ozon_pdf for rationale."""
     out: list[str] = []
-    for m in OZON_SHIP_LOOSE_RE.findall(text):
-        normalized = re.sub(r"\s+", "", m)
-        if OZON_SHIP_RE.fullmatch(normalized):
+    seen: set[str] = set()
+    loose_spans: list[tuple[int, int]] = []
+
+    for m in OZON_SHIP_LOOSE_RE.finditer(text):
+        normalized = re.sub(r"\s+", "", m.group(0))
+        if OZON_SHIP_RE.fullmatch(normalized) and normalized not in seen:
             out.append(normalized)
-    return out
+            seen.add(normalized)
+            loose_spans.append(m.span())
+
+    for m in OZON_SHIP_RE.finditer(text):
+        s_start, s_end = m.span()
+        if any(ls <= s_start and s_end <= le for ls, le in loose_spans):
+            continue
+        ship = m.group(0)
+        if ship not in seen:
+            out.append(ship)
+            seen.add(ship)
+
+    return out, len(loose_spans)
 
 
 # ---------- Утилиты для извлечения колонок и текста ----------
@@ -164,15 +180,13 @@ def map_ticket_pages(ticket_pdf: Path) -> dict[str, list[int]]:
     ship_to_pages: dict[str, list[int]] = defaultdict(list)
     for i, page in enumerate(doc):
         text = page.get_text("text")
-        ships = find_ships_loose(text)
-        if ships:
+        ships, n_split = find_ships_in_text(text)
+        if n_split:
             logging.info(
-                "OZON ticket page %d: matched via split-prefix layout (%d ships)",
+                "OZON ticket page %d: %d split-prefix shipment(s) detected",
                 i,
-                len(ships),
+                n_split,
             )
-        else:
-            ships = OZON_SHIP_RE.findall(text)
         for s in ships:
             if i not in ship_to_pages[s]:
                 ship_to_pages[s].append(i)
