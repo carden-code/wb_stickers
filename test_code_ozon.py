@@ -18,6 +18,7 @@ Ozon stickers → WB-style сортировка (v9)
 from __future__ import annotations
 
 import argparse
+import logging
 import re
 from collections import defaultdict, OrderedDict
 from pathlib import Path
@@ -26,6 +27,32 @@ import fitz  # PyMuPDF
 
 
 OZON_SHIP_RE = re.compile(r"\b\d{6,}-\d{3,5}-\d\b")  # пример: 58678967-0003-4
+OZON_SHIP_LOOSE_RE = re.compile(r"\d{1,6}\s+\d{1,6}\s*-\s*\d{3,5}\s*-\s*\d(?!\d)")
+
+
+def find_ships_in_text(text: str) -> tuple[list[str], int]:
+    """Return (ships, n_split_prefix). See utils.create_ozon_pdf for rationale."""
+    out: list[str] = []
+    seen: set[str] = set()
+    loose_spans: list[tuple[int, int]] = []
+
+    for m in OZON_SHIP_LOOSE_RE.finditer(text):
+        normalized = re.sub(r"\s+", "", m.group(0))
+        if OZON_SHIP_RE.fullmatch(normalized) and normalized not in seen:
+            out.append(normalized)
+            seen.add(normalized)
+            loose_spans.append(m.span())
+
+    for m in OZON_SHIP_RE.finditer(text):
+        s_start, s_end = m.span()
+        if any(ls <= s_start and s_end <= le for ls, le in loose_spans):
+            continue
+        ship = m.group(0)
+        if ship not in seen:
+            out.append(ship)
+            seen.add(ship)
+
+    return out, len(loose_spans)
 
 
 # ---------- Утилиты для извлечения колонок и текста ----------
@@ -62,23 +89,25 @@ def detect_columns_from_header(doc: fitz.Document) -> dict[str, float]:
 
 def column_bounds(x_cols: dict[str, float], name: str) -> tuple[float, float]:
     """
-    По словарю {col: x0} считает границы колонки по серединам между соседями.
+    [left, right) границы колонки, привязанные к левым краям заголовков:
+    `left = xs[idx]`, `right = xs[idx+1]`. Midpoint был слишком широк с обеих
+    сторон: справа отбрасывал хвостовые токены статьи (`"`, продолжения слов),
+    которые Озон рендерит за midpoint, но до начала следующей колонки; слева
+    пропускал переносы из «Товар» (например `сердцу"` на x≈307).
     """
     names = list(x_cols.keys())
     xs = list(x_cols.values())
-    mids = []
-    for i in range(len(xs) - 1):
-        mids.append((xs[i] + xs[i + 1]) / 2.0)
 
     idx = names.index(name)
-    left = float("-inf") if idx == 0 else mids[idx - 1]
-    right = float("inf") if idx == len(xs) - 1 else mids[idx]
+    left = float("-inf") if idx == 0 else xs[idx]
+    right = float("inf") if idx == len(xs) - 1 else xs[idx + 1]
     return left, right
 
 
 def normalize_text(s: str) -> str:
     s = re.sub(r"\s+([,.)»”])", r"\1", s)
     s = re.sub(r"([«“(])\s+", r"\1", s)
+    s = re.sub(r'(\s|^)"\s+(?=\S)', r'\1"', s)
     s = re.sub(r"\s{2,}", " ", s)
     return s.strip()
 
@@ -153,7 +182,13 @@ def map_ticket_pages(ticket_pdf: Path) -> dict[str, list[int]]:
     ship_to_pages: dict[str, list[int]] = defaultdict(list)
     for i, page in enumerate(doc):
         text = page.get_text("text")
-        ships = OZON_SHIP_RE.findall(text)
+        ships, n_split = find_ships_in_text(text)
+        if n_split:
+            logging.info(
+                "OZON ticket page %d: %d split-prefix shipment(s) detected",
+                i,
+                n_split,
+            )
         for s in ships:
             if i not in ship_to_pages[s]:
                 ship_to_pages[s].append(i)

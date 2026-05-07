@@ -11,6 +11,38 @@ import fitz  # PyMuPDF
 
 
 OZON_SHIP_RE = re.compile(r"\b\d{6,}-\d{3,5}-\d\b")
+OZON_SHIP_LOOSE_RE = re.compile(r"\d{1,6}\s+\d{1,6}\s*-\s*\d{3,5}\s*-\s*\d(?!\d)")
+
+
+def _find_ships_in_text(text: str) -> tuple[list[str], int]:
+    """Return (ships, n_split_prefix). Merges split-prefix and legacy formats.
+
+    Strict matches contained inside a loose span are dropped — they are the
+    truncated suffix that strict picks up when the split prefix sits flush
+    against the dash (e.g. `1234 567890-0001-2` → strict alone would yield
+    `567890-0001-2`, masking the real `1234567890-0001-2`).
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    loose_spans: list[tuple[int, int]] = []
+
+    for m in OZON_SHIP_LOOSE_RE.finditer(text):
+        normalized = re.sub(r"\s+", "", m.group(0))
+        if OZON_SHIP_RE.fullmatch(normalized) and normalized not in seen:
+            out.append(normalized)
+            seen.add(normalized)
+            loose_spans.append(m.span())
+
+    for m in OZON_SHIP_RE.finditer(text):
+        s_start, s_end = m.span()
+        if any(ls <= s_start and s_end <= le for ls, le in loose_spans):
+            continue
+        ship = m.group(0)
+        if ship not in seen:
+            out.append(ship)
+            seen.add(ship)
+
+    return out, len(loose_spans)
 
 
 def _detect_columns_from_header(doc: fitz.Document) -> dict[str, float]:
@@ -50,14 +82,21 @@ def _detect_columns_from_header(doc: fitz.Document) -> dict[str, float]:
 
 
 def _column_bounds(x_cols: dict[str, float], name: str) -> tuple[float, float]:
-    """Calculate left/right bounds for the column based on neighbours."""
+    """Return [left, right) bounds anchored on header left edges.
+
+    Both edges use header left positions (`xs[idx]` for left, `xs[idx+1]` for
+    right). The previous midpoint heuristic was too wide: the right side
+    dropped legitimate trailing article tokens (`"`, continuation words) that
+    Ozon renders past the midpoint but before the next column, while the
+    left side let tokens from the wrapping Товар column leak in (e.g.
+    `сердцу"` at x≈307 in `assembly_list (1).pdf`).
+    """
     names = list(x_cols.keys())
     xs = list(x_cols.values())
-    mids = [(xs[i] + xs[i + 1]) / 2.0 for i in range(len(xs) - 1)]
 
     idx = names.index(name)
-    left = float("-inf") if idx == 0 else mids[idx - 1]
-    right = float("inf") if idx == len(xs) - 1 else mids[idx]
+    left = float("-inf") if idx == 0 else xs[idx]
+    right = float("inf") if idx == len(xs) - 1 else xs[idx + 1]
     return left, right
 
 
@@ -65,6 +104,9 @@ def _normalize_text(value: str) -> str:
     """Cleanup whitespace artefacts inside joined tokens."""
     value = re.sub(r"\s+([,.)»”])", r"\1", value)
     value = re.sub(r"([«“(])\s+", r"\1", value)
+    # ASCII `"` rendered as a standalone token gets sandwiched by spaces on
+    # join. Treat ` " word` as an opening quote and attach it to the word.
+    value = re.sub(r'(\s|^)"\s+(?=\S)', r'\1"', value)
     value = re.sub(r"\s{2,}", " ", value)
     return value.strip()
 
@@ -123,7 +165,13 @@ def _map_ticket_pages(ticket_pdf: Path) -> dict[str, list[int]]:
         ship_to_pages: dict[str, list[int]] = defaultdict(list)
         for i, page in enumerate(doc):
             text = page.get_text("text")
-            ships = OZON_SHIP_RE.findall(text)
+            ships, n_split = _find_ships_in_text(text)
+            if n_split:
+                logging.info(
+                    "OZON ticket page %d: %d split-prefix shipment(s) detected",
+                    i,
+                    n_split,
+                )
             for ship in ships:
                 if i not in ship_to_pages[ship]:
                     ship_to_pages[ship].append(i)
