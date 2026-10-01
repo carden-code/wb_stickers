@@ -192,29 +192,29 @@ async def handle_ozon_ticket(message: types.Message, state: FSMContext):
         return
 
     ticket_file = f"ozon_ticket_{message.from_user.id}.pdf"
-    await message.document.download(destination_file=ticket_file)
-    await state.update_data(ticket_file=ticket_file)
-    await message.answer("Немного подожди, сейчас я сформирую файл.")
-
     user_data = await state.get_data()
     assembly_path = user_data.get('assembly_file')
-    ticket_path = user_data.get('ticket_file')
     output_pdf_path = f"ozon_sorted_{message.from_user.id}.pdf"
-
-    success = await process_ozon_files(assembly_path, ticket_path, output_pdf_path)
     keyboard = _menu_keyboard()
 
-    if success and os.path.exists(output_pdf_path):
-        with open(output_pdf_path, 'rb') as file:
-            await bot.send_document(message.from_user.id, file)
-        await message.answer("✅ Обработка завершена.", reply_markup=keyboard)
-    else:
-        await message.answer(
-            "Не удалось обработать файлы OZON. Проверь, что отправил сборочный лист и стикеры в формате PDF и попробуй снова.",
-            reply_markup=keyboard,
-        )
-
-    _safe_remove(assembly_path)
-    _safe_remove(ticket_path)
-    _safe_remove(output_pdf_path)
-    await state.finish()
+    try:
+        await message.document.download(destination_file=ticket_file)
+        await state.update_data(ticket_file=ticket_file)
+        await message.answer("Немного подожди, сейчас я сформирую файл.")
+        result = await process_ozon_files(assembly_path, ticket_file, output_pdf_path)
+        if result.success and os.path.exists(output_pdf_path):
+            with open(output_pdf_path, 'rb') as file:
+                await bot.send_document(message.from_user.id, file)
+            await message.answer("✅ Обработка завершена.", reply_markup=keyboard)
+        else:
+            await message.answer(
+                result.error_message or "Не удалось сформировать PDF Ozon. Попробуйте снова.",
+                reply_markup=keyboard,
+            )
+    finally:
+        try:
+            _safe_remove(assembly_path)
+            _safe_remove(ticket_file)
+            _safe_remove(output_pdf_path)
+        finally:
+            await state.finish()
