@@ -1,259 +1,303 @@
-"""Utilities for processing Ozon sticker PDFs into WB-style grouped output."""
+"""Read Ozon assembly rows and group intact ticket pages by full article."""
 
 from __future__ import annotations
 
 import logging
 import re
-from collections import defaultdict, OrderedDict
+from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
-import fitz  # PyMuPDF
+import fitz
 
 
-OZON_SHIP_RE = re.compile(r"\b\d{6,}-\d{3,5}-\d\b")
-OZON_SHIP_LOOSE_RE = re.compile(r"\d{1,6}\s+\d{1,6}\s*-\s*\d{3,5}\s*-\s*\d(?!\d)")
+DEFAULT_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+OZON_SHIP_RE = re.compile(r"(?<!\w)\d{6,}-\d{3,5}-\d+(?!\w)")
+OZON_SHIP_LOOSE_RE = re.compile(
+    r"(?<!\w)\d{1,6}\s+\d{1,6}\s*-\s*\d{3,5}\s*-\s*\d+(?!\w)"
+)
+OZON_SHIP_SPACED_RE = re.compile(r"(?<!\w)\d{6,}\s*-\s*\d{3,5}\s*-\s*\d+(?!\w)")
+OZON_LABEL_RE = re.compile(r"(?<!\w)ii\d+(?!\w)")
+# The current label renders seven prefix digits and its four-digit suffix
+# separately. Bound both pieces so unrelated numbers cannot be appended.
+OZON_LABEL_SPLIT_RE = re.compile(r"(?<!\w)ii\d{7}\s+\d{4}(?!\w)")
+
+
+class OzonValidationError(ValueError):
+    """Invalid or ambiguous input, with a message safe to show in Telegram."""
+
+
+@dataclass(frozen=True)
+class OzonProcessingResult:
+    success: bool
+    error_message: str | None = None
+
+
+@dataclass(frozen=True)
+class AssemblyRow:
+    shipment: str
+    label: str | None
+    article: str
+
+
+def _merge_matches(text: str, strict: re.Pattern, loose: re.Pattern) -> tuple[list[str], int]:
+    """Prefer complete split identifiers over their truncated strict suffixes."""
+    spans = list(loose.finditer(text))
+    matches = [(m.start(), re.sub(r"\s+", "", m.group())) for m in spans]
+    matches.extend(
+        (m.start(), m.group())
+        for m in strict.finditer(text)
+        if not any(s.start() <= m.start() and m.end() <= s.end() for s in spans)
+    )
+    return list(dict.fromkeys(value for _, value in sorted(matches))), len(spans)
 
 
 def _find_ships_in_text(text: str) -> tuple[list[str], int]:
-    """Return (ships, n_split_prefix). Merges split-prefix and legacy formats.
+    # FBS warehouse numbers are not part of a split shipment prefix.
+    text = re.sub(r"(?m)^FBS:[^\S\n]*\d+[^\S\n]*$", "", text)
+    ships, n_split = _merge_matches(text, OZON_SHIP_SPACED_RE, OZON_SHIP_LOOSE_RE)
+    return list(dict.fromkeys(re.sub(r"\s+", "", ship) for ship in ships)), n_split
 
-    Strict matches contained inside a loose span are dropped — they are the
-    truncated suffix that strict picks up when the split prefix sits flush
-    against the dash (e.g. `1234 567890-0001-2` → strict alone would yield
-    `567890-0001-2`, masking the real `1234567890-0001-2`).
-    """
-    out: list[str] = []
-    seen: set[str] = set()
-    loose_spans: list[tuple[int, int]] = []
 
-    for m in OZON_SHIP_LOOSE_RE.finditer(text):
-        normalized = re.sub(r"\s+", "", m.group(0))
-        if OZON_SHIP_RE.fullmatch(normalized) and normalized not in seen:
-            out.append(normalized)
-            seen.add(normalized)
-            loose_spans.append(m.span())
-
-    for m in OZON_SHIP_RE.finditer(text):
-        s_start, s_end = m.span()
-        if any(ls <= s_start and s_end <= le for ls, le in loose_spans):
-            continue
-        ship = m.group(0)
-        if ship not in seen:
-            out.append(ship)
-            seen.add(ship)
-
-    return out, len(loose_spans)
+def _find_labels_in_text(text: str) -> list[str]:
+    return _merge_matches(text, OZON_LABEL_RE, OZON_LABEL_SPLIT_RE)[0]
 
 
 def _detect_columns_from_header(doc: fitz.Document) -> dict[str, float]:
-    """Return mapping of column names to their left x-coordinate from the first page."""
-    page0 = doc[0]
-    words = sorted(page0.get_text("words"), key=lambda w: (w[1], w[0]))
-    header_tokens = {
-        "№",
-        "Номер",
-        "отправления",
-        "Фото",
-        "Товар",
-        "Артикул",
-        "Кол-во",
-        "Этикетка",
-    }
-
-    name_to_x: dict[str, float] = {}
-    for w in words:
-        txt = w[4]
-        if txt in header_tokens:
-            name_to_x[txt] = min(name_to_x.get(txt, w[0]), w[0])
-
-    if "Номер" in name_to_x and "отправления" in name_to_x:
-        name_to_x["Номер отправления"] = min(name_to_x["Номер"], name_to_x["отправления"])
-
-    cols = {
-        "№": name_to_x.get("№", 0.0),
-        "Номер отправления": name_to_x.get("Номер отправления", 0.0),
-        "Фото": name_to_x.get("Фото", 0.0),
-        "Товар": name_to_x.get("Товар", 0.0),
-        "Артикул": name_to_x.get("Артикул", 0.0),
-        "Кол-во": name_to_x.get("Кол-во", 0.0),
-        "Этикетка": name_to_x.get("Этикетка", 0.0),
-    }
-    return dict(sorted(cols.items(), key=lambda kv: kv[1]))
+    if not len(doc):
+        raise OzonValidationError("Сборочный лист пуст.")
+    page = doc[0]
+    words = page.get_text("words")
+    anchors = [w for w in words if w[4] == "Артикул"]
+    names = ("№", "Номер", "Фото", "Товар", "Артикул", "Кол-во", "Этикетка")
+    for anchor in anchors:
+        band = fitz.Rect(0, max(0, anchor[1] - 12), page.rect.width, anchor[3] + 12)
+        cols = {}
+        for name in names:
+            # search_for also finds Номер inside the merged token №Номер.
+            hits = page.search_for(name, clip=band)
+            if hits:
+                cols[name] = min(rect.x0 for rect in hits)
+        if len(cols) == len(names) and all(cols[a] < cols[b] for a, b in zip(names, names[1:])):
+            cols["Номер отправления"] = cols.pop("Номер")
+            return dict(sorted(cols.items(), key=lambda item: item[1]))
+    raise OzonValidationError("Не удалось определить столбцы сборочного листа. Пришлите исходный PDF Ozon.")
 
 
-def _column_bounds(x_cols: dict[str, float], name: str) -> tuple[float, float]:
-    """Return [left, right) bounds anchored on header left edges.
-
-    Both edges use header left positions (`xs[idx]` for left, `xs[idx+1]` for
-    right). The previous midpoint heuristic was too wide: the right side
-    dropped legitimate trailing article tokens (`"`, continuation words) that
-    Ozon renders past the midpoint but before the next column, while the
-    left side let tokens from the wrapping Товар column leak in (e.g.
-    `сердцу"` at x≈307 in `assembly_list (1).pdf`).
-    """
-    names = list(x_cols.keys())
-    xs = list(x_cols.values())
-
-    idx = names.index(name)
-    left = float("-inf") if idx == 0 else xs[idx]
-    right = float("inf") if idx == len(xs) - 1 else xs[idx + 1]
-    return left, right
+def _column_bounds(cols: dict[str, float], name: str) -> tuple[float, float]:
+    names = list(cols)
+    index = names.index(name)
+    return cols[name], cols[names[index + 1]] if index + 1 < len(names) else float("inf")
 
 
 def _normalize_text(value: str) -> str:
-    """Cleanup whitespace artefacts inside joined tokens."""
+    value = re.sub(r"\s+", " ", value)
     value = re.sub(r"\s+([,.)»”])", r"\1", value)
     value = re.sub(r"([«“(])\s+", r"\1", value)
-    # ASCII `"` rendered as a standalone token gets sandwiched by spaces on
-    # join. Treat ` " word` as an opening quote and attach it to the word.
     value = re.sub(r'(\s|^)"\s+(?=\S)', r'\1"', value)
-    value = re.sub(r"\s{2,}", " ", value)
-    return value.strip()
+    value = re.sub(r'"([^"]*)"', lambda match: '"' + match.group(1).strip() + '"', value)
+    return re.sub(r"\s{2,}", " ", value).strip()
 
 
-def _extract_full_artikul_map(asm_pdf: Path, y_band: float = 12.0) -> tuple[list[str], dict[str, str]]:
-    doc = fitz.open(asm_pdf)
-    try:
-        x_cols = _detect_columns_from_header(doc)
-        art_left, art_right = _column_bounds(x_cols, "Артикул")
+def _join_words(words: list[tuple]) -> str:
+    lines: dict[float, list[tuple]] = defaultdict(list)
+    for word in words:
+        lines[round(word[1], 1)].append(word)
+    return "\n".join(
+        " ".join(w[4] for w in sorted(line, key=lambda w: w[0]))
+        for _, line in sorted(lines.items())
+    )
 
-        ship_order: list[str] = []
-        art_by_ship: dict[str, str] = OrderedDict()
 
-        for page in doc:
-            words = [tuple(w) for w in page.get_text("words")]
-            words_sorted = sorted(words, key=lambda w: (w[1], w[0]))
-            art_words = [w for w in words_sorted if art_left <= w[0] < art_right and w[4].strip()]
+def _table_separators(page: fitz.Page, cols: dict[str, float]) -> list[float]:
+    """Merge adjacent header segments as well as full-width row rules."""
+    segments: dict[float, list[tuple[float, float]]] = defaultdict(list)
+    for drawing in page.get_drawings():
+        for item in drawing["items"]:
+            if item[0] == "l":
+                a, b = item[1:]
+                if abs(a.y - b.y) < 0.1:
+                    segments[round(a.y, 1)].append(tuple(sorted((a.x, b.x))))
+    separators = []
+    for y, intervals in sorted(segments.items()):
+        merged: list[list[float]] = []
+        for left, right in sorted(intervals):
+            if merged and left <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], right)
+            else:
+                merged.append([left, right])
+        if any(left <= cols["№"] and right >= cols["Этикетка"] for left, right in merged):
+            separators.append(y)
+    return separators
 
-            for w in words_sorted:
-                token = w[4].strip()
-                if not OZON_SHIP_RE.fullmatch(token):
+
+def _extract_assembly_rows(asm_pdf: Path) -> list[AssemblyRow]:
+    with fitz.open(asm_pdf) as doc:
+        cols = _detect_columns_from_header(doc)
+        ship_left, ship_right = _column_bounds(cols, "Номер отправления")
+        art_left, art_right = _column_bounds(cols, "Артикул")
+        rows: list[AssemblyRow] = []
+        seen_ships: set[str] = set()
+        seen_labels: set[str] = set()
+        pending: list[list[tuple]] = []
+        for page_number, page in enumerate(doc, 1):
+            words = page.get_text("words")
+            separators = _table_separators(page, cols)
+            if not separators:
+                raise OzonValidationError(f"Не удалось определить строки сборочного листа на странице {page_number}.")
+            # Continuation pages have no top border. An unfinished bottom
+            # row may also continue above the next page's first rule.
+            boundaries = separators if page_number == 1 else [page.rect.y0, *separators]
+            boundaries = [*boundaries, page.rect.y1]
+            consumed: set[tuple] = set()
+            for top, bottom in zip(boundaries, boundaries[1:]):
+                row_words = [w for w in words if top < (w[1] + w[3]) / 2 < bottom]
+                ship_words = [w for w in row_words if ship_left <= w[0] < ship_right]
+                art_words = [w for w in row_words if art_left <= w[0] < art_right]
+                # A repeated column header is not an order row.
+                if any(w[4] == "Артикул" for w in row_words) and any(w[4] == "Кол-во" for w in row_words):
                     continue
-
-                ship = token
-                ship_order.append(ship)
-                y_s = w[1]
-
-                band = [aw for aw in art_words if abs(aw[1] - y_s) <= y_band]
-                if not band:
-                    art_by_ship[ship] = "—"
+                if not ship_words and not art_words and not pending:
                     continue
-
-                lines: dict[float, list[tuple]] = {}
-                for aw in band:
-                    y_key = round(aw[1], 1)
-                    lines.setdefault(y_key, []).append(aw)
-
-                tokens: list[str] = []
-                for _, arr in sorted(lines.items(), key=lambda kv: kv[0]):
-                    for x0, y0, x1, y1, txt, *_ in sorted(arr, key=lambda a: (a[0], a[1])):
-                        text = txt.strip()
-                        if text:
-                            tokens.append(text)
-
-                text = _normalize_text(" ".join(tokens))
-                art_by_ship[ship] = text if len(text) > 2 else "—"
-
-        return ship_order, art_by_ship
-    finally:
-        doc.close()
-
-
-def _map_ticket_pages(ticket_pdf: Path) -> dict[str, list[int]]:
-    doc = fitz.open(ticket_pdf)
-    try:
-        ship_to_pages: dict[str, list[int]] = defaultdict(list)
-        for i, page in enumerate(doc):
-            text = page.get_text("text")
-            ships, n_split = _find_ships_in_text(text)
-            if n_split:
-                logging.info(
-                    "OZON ticket page %d: %d split-prefix shipment(s) detected",
-                    i,
-                    n_split,
+                consumed.update(ship_words)
+                fragments = [*pending, row_words]
+                if bottom == page.rect.y1:
+                    pending = fragments
+                    continue
+                pending = []
+                text = "\n".join(
+                    _join_words([w for w in fragment if ship_left <= w[0] < ship_right])
+                    for fragment in fragments
                 )
-            for ship in ships:
-                if i not in ship_to_pages[ship]:
-                    ship_to_pages[ship].append(i)
-        return ship_to_pages
-    finally:
-        doc.close()
+                shipments, _ = _find_ships_in_text(text)
+                labels = _find_labels_in_text(text)
+                if len(shipments) != 1 or len(labels) > 1:
+                    raise OzonValidationError(
+                        f"Не удалось однозначно прочитать отправление в сборочном листе на странице {page_number}."
+                    )
+                shipment = shipments[0]
+                label = labels[0] if labels else None
+                article = _normalize_text("\n".join(
+                    _join_words([w for w in fragment if art_left <= w[0] < art_right])
+                    for fragment in fragments
+                ))
+                if not article or article in {"—", "-"}:
+                    raise OzonValidationError(f"У отправления {shipment} не указан артикул.")
+                if shipment in seen_ships or (label is not None and label in seen_labels):
+                    raise OzonValidationError("В сборочном листе повторяется номер отправления или этикетки.")
+                rows.append(AssemblyRow(shipment, label, article))
+                seen_ships.add(shipment)
+                if label:
+                    seen_labels.add(label)
+            unconsumed = [w for w in words if ship_left <= w[0] < ship_right and w not in consumed]
+            text = _join_words(unconsumed)
+            if _find_ships_in_text(text)[0] or _find_labels_in_text(text):
+                raise OzonValidationError(f"Не удалось определить границы всех строк на странице {page_number}.")
+        if pending:
+            raise OzonValidationError("Не удалось определить нижнюю границу последнего отправления сборочного листа.")
+        count = re.search(r"Количество\s+отправлений:\s*(\d+)", doc[0].get_text())
+        if not rows or (count and len(rows) != int(count.group(1))):
+            raise OzonValidationError("Не удалось прочитать все отправления сборочного листа.")
+        return rows
 
 
-def _build_pdf_wbstyle(
-    asm_pdf: Path,
-    ticket_pdf: Path,
-    out_pdf: Path,
-    font_path: str = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-) -> None:
-    ship_order, art_by_ship = _extract_full_artikul_map(asm_pdf, y_band=12.0)
-    ship_to_pages = _map_ticket_pages(ticket_pdf)
+def _extract_full_artikul_map(asm_pdf: Path) -> tuple[list[str], dict[str, str]]:
+    rows = _extract_assembly_rows(asm_pdf)
+    return [row.shipment for row in rows], {row.shipment: row.article for row in rows}
 
-    by_art: dict[str, list[str]] = defaultdict(list)
-    for ship in ship_order:
-        by_art[art_by_ship.get(ship, "—")].append(ship)
-    arts_sorted = sorted(by_art.keys(), key=lambda x: (x is None, str(x)))
 
-    ticket_doc = fitz.open(ticket_pdf)
-    try:
-        total_pages = len(ticket_doc)
-    finally:
-        ticket_doc.close()
-
-    ordered_indices: list[int] = []
-    group_meta: list[tuple[int, str, int]] = []
-
-    for art in arts_sorted:
-        ships = by_art[art]
-        group_meta.append((len(ordered_indices), art, len(ships)))
-        for ship in ships:
-            ordered_indices.extend(ship_to_pages.get(ship, []))
-
-    seen = set(ordered_indices)
-    leftovers = [i for i in range(total_pages) if i not in seen]
-    ordered_indices.extend(leftovers)
-
-    doc = fitz.open(ticket_pdf)
-    try:
-        doc.select(ordered_indices)
-
-        font_name = "DejaVuSans"
-        offset = 0
-        for insert_idx, art, count in group_meta:
-            insert_at = min(insert_idx + offset, len(doc))
-            page = doc.new_page(
-                pno=insert_at,
-                width=doc[0].rect.width,
-                height=doc[0].rect.height,
+def _map_ticket_pages(doc: fitz.Document, rows: list[AssemblyRow]) -> dict[str, list[int]]:
+    by_ship = {row.shipment: row for row in rows}
+    by_label = {row.label: row.shipment for row in rows if row.label}
+    mapping: dict[str, list[int]] = defaultdict(list)
+    for index, page in enumerate(doc):
+        text = page.get_text()
+        ships, _ = _find_ships_in_text(text)
+        labels = _find_labels_in_text(text)
+        if not ships and not labels:
+            raise OzonValidationError(f"Не удалось распознать этикетку на странице {index + 1}.")
+        if any(ship not in by_ship for ship in ships) or any(label not in by_label for label in labels):
+            raise OzonValidationError(
+                f"Этикетка на странице {index + 1} отсутствует в сборочном листе. "
+                "Проверьте, что файлы относятся к одной сборке."
             )
-            text = f"Артикул: {art}\nКоличество: {count}"
-            page.insert_textbox(
-                rect=page.rect,
-                buffer=text,
-                fontsize=12,
-                fontname=font_name,
-                fontfile=font_path,
-                color=(0, 0, 0),
-                align=0,
+        owners = set(ships) | {by_label[label] for label in labels}
+        if len(owners) != 1:
+            raise OzonValidationError(
+                f"На странице {index + 1} указаны противоречивые номера отправления или этикетки."
             )
-            offset += 1
+        mapping[owners.pop()].append(index)
+    missing = set(by_ship) - set(mapping)
+    if missing:
+        raise OzonValidationError(
+            f"В файле этикеток не найдены {len(missing)} отправления из сборочного листа. "
+            "Пришлите полный комплект этикеток."
+        )
+    logging.info(
+        "OZON: matched %d/%d shipments, %d/%d ticket pages",
+        len(mapping), len(rows), sum(map(len, mapping.values())), len(doc),
+    )
+    return dict(mapping)
 
+
+def _insert_separator(page: fitz.Page, article: str, count: int, font_path: str) -> None:
+    text = f"Артикул: {article}\nКоличество: {count}"
+    rect = page.rect + (3, 3, -3, -3)
+    for fontsize in range(12, 5, -1):
+        # Shape only commits after the entire textbox fits.
+        shape = page.new_shape()
+        remaining = shape.insert_textbox(
+            rect, text, fontsize=fontsize, fontname="DejaVuSans", fontfile=font_path,
+        )
+        if remaining >= 0:
+            shape.commit()
+            return
+    raise OzonValidationError(
+        "Название артикула не помещается на разделителе даже при уменьшении шрифта. Проверьте сборочный лист."
+    )
+
+
+def _build_pdf_wbstyle(asm_pdf: Path, ticket_pdf: Path, out_pdf: Path, font_path: str = DEFAULT_FONT) -> None:
+    rows = _extract_assembly_rows(asm_pdf)
+    groups: dict[str, list[AssemblyRow]] = defaultdict(list)
+    for row in rows:
+        groups[row.article].append(row)
+    with fitz.open(ticket_pdf) as doc:
+        mapping = _map_ticket_pages(doc, rows)
+        indices: list[int] = []
+        separators = []
+        for article, group in sorted(groups.items()):
+            separators.append((len(indices), article, len(group)))
+            for row in group:
+                indices.extend(mapping[row.shipment])
+        doc.select(indices)
+        for offset, (index, article, count) in enumerate(separators):
+            # Match the dimensions of this group's first ticket page.
+            rect = doc[index + offset].rect
+            page = doc.new_page(pno=index + offset, width=rect.width, height=rect.height)
+            _insert_separator(page, article, count, font_path)
         doc.save(out_pdf, garbage=4)
-    finally:
-        doc.close()
+    logging.info("OZON: saved %d article groups, %d original pages", len(groups), len(indices))
 
 
 async def process_ozon_files(
     assembly_pdf_path: str,
     ticket_pdf_path: str,
     output_pdf_path: str,
-    font_path: str = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-) -> bool:
-    """Convert Ozon assembly/ticket PDFs into grouped ticket output."""
+    font_path: str = DEFAULT_FONT,
+) -> OzonProcessingResult:
     try:
-        _build_pdf_wbstyle(Path(assembly_pdf_path), Path(ticket_pdf_path), Path(output_pdf_path), font_path=font_path)
-        return True
-    except Exception as exc:
-        logging.error("Ошибка при обработке OZON файлов: %s", exc)
-        return False
-
+        _build_pdf_wbstyle(
+            Path(assembly_pdf_path), Path(ticket_pdf_path), Path(output_pdf_path), font_path=font_path,
+        )
+        return OzonProcessingResult(True)
+    except OzonValidationError as exc:
+        logging.warning("OZON: input rejected: %s", exc)
+        return OzonProcessingResult(False, str(exc))
+    except Exception:
+        logging.exception("OZON: processing failed")
+        return OzonProcessingResult(
+            False,
+            "Не удалось обработать PDF Ozon. Проверьте, что отправлены исходные PDF "
+            "сборочного листа и этикеток, и попробуйте снова.",
+        )
